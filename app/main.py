@@ -3,13 +3,39 @@
 结合总表与各分表的累计读数、分表功率上限，用线性规划求指定分表在
 指定时段内可行耗电量的精确最小/最大值，用于判断结算分界时刻缺测的
 分表电量是否足以确定、是否需要补抄。
+
+新增按结算期的整批发布与查询能力：
+- ``POST /api/v1/periods/{period}/publish``：整批物理相容 + 预期版本号匹配时
+  原子替换正式读数并递增版本（乐观并发 + 幂等键）；
+- ``POST /api/v1/periods/{period}/infer``：对该期当前正式版本做推算，
+  整次推算使用同一版读数，响应附版本号。
+数据与请求结果落在本地 SQLite（Docker 卷持久化），重启后保留。
 """
 from __future__ import annotations
 
-from fastapi import Body, FastAPI
+from contextlib import asynccontextmanager
 
-from .models import InferRequest, InferResponse
-from .solver import MeterSeries, solve_window
+from fastapi import Body, FastAPI, Path, Request
+from fastapi.responses import JSONResponse
+
+from . import service, storage
+from .models import (
+    InferRequest,
+    InferResponse,
+    PeriodInferRequest,
+    PeriodInferResponse,
+    PeriodSummary,
+    PublishRequest,
+    PublishResponse,
+    VersionInfo,
+)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    conn = storage.get_conn()  # 启动即建库建表并启用 WAL
+    conn.close()
+    yield
+
 
 app = FastAPI(
     title="园区分表电量推算 API",
@@ -18,10 +44,15 @@ app = FastAPI(
         "及各分表功率上限，基于线性规划求指定分表在指定起止时刻之间"
         "可行耗电量的最小值与最大值（精确边界，非线性插值）。"
         "约束：任意时段总表耗电 = 全部分表之和；分表耗电非负且不超功率上限；"
-        "不考虑损耗、换表与回零。读数不相容时返回 status=incompatible。"
+        "不考虑损耗、换表与回零。读数不相容时返回 status=incompatible。\n\n"
+        "结算期发布：整批读数通过物理相容性检查且预期版本号匹配时，原子替换"
+        "正式读数并递增版本；同版本并发提交最多一个成功。请求键保证同键同内容"
+        "重传回放原发布结果，同键异内容拒绝。数据在本地 SQLite WAL 持久化，重启保留。"
     ),
-    version="1.0.0",
+    version="2.0.0",
+    lifespan=lifespan,
 )
+
 
 # ---------------------------------------------------------------------------
 # 交互式文档示例（Swagger UI /docs 中可直接 Try it out 演示）
@@ -119,6 +150,82 @@ EXAMPLE_INCOMPATIBLE = {
     },
 }
 
+# 发布示例：首次发布 expected_version=0，请求键由客户端生成
+EXAMPLE_PUBLISH_FIRST = {
+    **_EXAMPLE_METERS,
+    "expected_version": 0,
+    "request_key": "bulk-2026-01-upload-0001",
+}
+
+# 第二批（同一结算期的下一版）：expected_version=1
+_EXAMPLE_METERS_V2 = {
+    "meters": [
+        {
+            "meter_id": "meter_total",
+            "role": "total",
+            "readings": [
+                {"time": "2026-01-01T00:00:00Z", "value": 1000.0},
+                {"time": "2026-01-01T01:00:00Z", "value": 1010.0},
+                {"time": "2026-01-01T02:00:00Z", "value": 1050.0},
+                {"time": "2026-01-01T03:00:00Z", "value": 1080.0},
+                {"time": "2026-01-01T04:00:00Z", "value": 1100.0},
+            ],
+        },
+        {
+            "meter_id": "sub_a",
+            "role": "sub",
+            "max_power_kw": 20.0,
+            "readings": [
+                {"time": "2026-01-01T00:00:00Z", "value": 500.0},
+                {"time": "2026-01-01T04:00:00Z", "value": 560.0},
+            ],
+        },
+        {
+            "meter_id": "sub_b",
+            "role": "sub",
+            "max_power_kw": 20.0,
+            "readings": [
+                {"time": "2026-01-01T00:00:00Z", "value": 200.0},
+                {"time": "2026-01-01T04:00:00Z", "value": 240.0},
+            ],
+        },
+    ],
+}
+
+EXAMPLE_PUBLISH_NEXT = {
+    **_EXAMPLE_METERS_V2,
+    "expected_version": 1,
+    "request_key": "bulk-2026-01-upload-0002",
+}
+
+EXAMPLE_PUBLISH_INCOMPATIBLE = {
+    "meters": EXAMPLE_INCOMPATIBLE["meters"],
+    "expected_version": 0,
+    "request_key": "bulk-2026-01-upload-bad",
+}
+
+EXAMPLE_PUBLISH_BAD_VERSION = {
+    **_EXAMPLE_METERS,
+    "expected_version": 99,
+    "request_key": "bulk-2026-01-upload-wrongver",
+}
+
+EXAMPLE_PERIOD_INFER = {
+    "query": {
+        "meter_id": "sub_a",
+        "start": "2026-01-01T01:00:00Z",
+        "end": "2026-01-01T02:00:00Z",
+    }
+}
+
+PERIOD_PATH = Path(
+    ...,
+    min_length=1,
+    max_length=64,
+    pattern=r"^[A-Za-z0-9._-]+$",
+    description="结算期标识（字母、数字、点、下划线、短横线）",
+)
+
 
 @app.get("/", include_in_schema=False)
 def root() -> dict:
@@ -128,6 +235,44 @@ def root() -> dict:
 @app.get("/health", include_in_schema=False)
 def health() -> dict:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 异常处理
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(service.PublishError)
+def _publish_error_handler(_: Request, exc: service.PublishError) -> JSONResponse:
+    return JSONResponse(status_code=exc.http_status, content=exc.body())
+
+
+@app.exception_handler(service.PeriodNotFound)
+def _period_not_found_handler(_: Request, exc: service.PeriodNotFound) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": {
+                "code": "period_not_found",
+                "message": f"结算期 {exc.period} 尚无已发布的正式读数",
+                "period": exc.period,
+            }
+        },
+    )
+
+
+@app.exception_handler(ValueError)
+def _value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
+    """路由层业务校验失败（如查询窗口越界）统一映射为 422，与入参校验一致。"""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": [{"type": "value_error", "msg": str(exc)}]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 原有接口：即时推算（不落库、无版本）
+# ---------------------------------------------------------------------------
 
 
 @app.post(
@@ -156,56 +301,102 @@ def infer(
         }
     ),
 ) -> InferResponse:
-    meters = [
-        MeterSeries(
-            meter_id=m.meter_id,
-            role=m.role,
-            max_power_kw=m.max_power_kw,
-            times_ms=[_to_ms(r.time) for r in sorted(m.readings, key=lambda r: r.time)],
-            values=[r.value for r in sorted(m.readings, key=lambda r: r.time)],
-        )
-        for m in req.meters
-    ]
-    result = solve_window(
-        meters,
-        query_meter_id=req.query.meter_id,
-        q_start_ms=_to_ms(req.query.start),
-        q_end_ms=_to_ms(req.query.end),
-    )
-
-    if not result.feasible:
-        return InferResponse(
-            status="incompatible",
-            meter_id=req.query.meter_id,
-            start=req.query.start,
-            end=req.query.end,
-            min_kwh=None,
-            max_kwh=None,
-            is_determined=None,
-            message="读数不相容：现有读数在“总表=分表之和、分表耗电非负且受功率上限约束”下无可行解",
-            diagnostics=result.diagnostics
-            or ["约束联立后无可行解（未定位到单一原因，请核查各表读数）"],
-        )
-
-    is_determined = (result.max_kwh - result.min_kwh) <= 1e-6 * max(
-        1.0, abs(result.max_kwh)
-    )
-    if is_determined:
-        message = "该时段电量可被现有读数唯一确定，可直接结算，无需补抄"
-    else:
-        message = "该时段电量只能确定到可行区间，请结合结算精度要求判断是否需要补抄"
-    return InferResponse(
-        status="ok",
-        meter_id=req.query.meter_id,
-        start=req.query.start,
-        end=req.query.end,
-        min_kwh=result.min_kwh,
-        max_kwh=result.max_kwh,
-        is_determined=is_determined,
-        message=message,
-        diagnostics=[],
-    )
+    return service.run_infer(req.meters, req.query)
 
 
-def _to_ms(t) -> int:
-    return round(t.timestamp() * 1000)
+# ---------------------------------------------------------------------------
+# 按结算期发布
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/periods/{period}/publish",
+    response_model=PublishResponse,
+    responses={409: {"description": "版本不匹配 / 批次不相容 / 同键异内容"}},
+    summary="按结算期原子发布整批电表读数",
+)
+def publish(
+    period: str = PERIOD_PATH,
+    req: PublishRequest = Body(
+        openapi_examples={
+            "首次发布（expected_version=0）": {
+                "summary": "结算期 2026-01 的首次整批发布，预期当前版本为 0",
+                "value": EXAMPLE_PUBLISH_FIRST,
+            },
+            "发布下一版（expected_version=1）": {
+                "summary": "已存在版本 1 时，预期版本传 1，成功后原子替换为版本 2",
+                "value": EXAMPLE_PUBLISH_NEXT,
+            },
+            "不相容批次被拒绝": {
+                "summary": "总表 100 kWh 与分表合计 110 kWh 不平衡，"
+                "拒绝发布且旧版保持不变",
+                "value": EXAMPLE_PUBLISH_INCOMPATIBLE,
+            },
+            "预期版本号不匹配": {
+                "summary": "当前版本并非 99，返回 409 version_conflict，旧版保留",
+                "value": EXAMPLE_PUBLISH_BAD_VERSION,
+            },
+        }
+    ),
+) -> JSONResponse:
+    http_status, body = service.publish_batch(period, req)
+    if isinstance(body, PublishResponse):
+        body = body.model_dump(mode="json")
+    return JSONResponse(status_code=http_status, content=body)
+
+
+# ---------------------------------------------------------------------------
+# 按结算期推算（读取已发布的正式版本）
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/periods/{period}/infer",
+    response_model=PeriodInferResponse,
+    responses={404: {"description": "该结算期尚无已发布读数"}},
+    summary="基于结算期当前正式版本读数推算（整次推算同版，响应附版本号）",
+)
+def period_infer(period: str = PERIOD_PATH, req: PeriodInferRequest = Body(
+    openapi_examples={
+        "推算已发布结算期": {
+            "summary": "对结算期 2026-01 的当前正式版本查询 sub_a 的 "
+            "01:00~02:00 电量，响应携带所用版本号",
+            "value": EXAMPLE_PERIOD_INFER,
+        }
+    },
+)) -> PeriodInferResponse:
+    return service.infer_published(period, req.query)
+
+
+# ---------------------------------------------------------------------------
+# 结算期状态查询
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/api/v1/periods",
+    response_model=list[PeriodSummary],
+    summary="列出所有结算期及其当前正式版本",
+)
+def list_periods() -> list[dict]:
+    return service.list_period_summaries()
+
+
+@app.get(
+    "/api/v1/periods/{period}",
+    response_model=PeriodSummary,
+    responses={404: {"description": "结算期不存在"}},
+    summary="查询单个结算期的当前版本状态",
+)
+def get_period(period: str = PERIOD_PATH) -> dict:
+    return service.get_period_summary(period)
+
+
+@app.get(
+    "/api/v1/periods/{period}/versions",
+    response_model=list[VersionInfo],
+    responses={404: {"description": "结算期不存在"}},
+    summary="列出结算期的历史版本（版本号严格递增、不重复）",
+)
+def get_period_versions(period: str = PERIOD_PATH) -> list[dict]:
+    return service.list_period_versions(period)

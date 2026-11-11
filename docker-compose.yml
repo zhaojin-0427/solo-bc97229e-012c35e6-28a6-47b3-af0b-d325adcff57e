@@ -5,4 +5,13 @@ services:
     container_name: meter-infer-api
     ports:
       - "8000:8000"
+    environment:
+      # SQLite 数据文件位置（容器内），通过下方命名卷持久化
+      METER_DB_PATH: /srv/data/meter_store.db
+    volumes:
+      - meter_data:/srv/data
     restart: unless-stopped
+
+volumes:
+  meter_data:
+    name: meter_infer_data

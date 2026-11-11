@@ -51,19 +51,30 @@ class SolveResult:
     diagnostics: list[str] = field(default_factory=list)
 
 
-def solve_window(
-    meters: list[MeterSeries],
-    query_meter_id: str,
-    q_start_ms: int,
-    q_end_ms: int,
-) -> SolveResult:
-    """求指定分表在 [q_start_ms, q_end_ms) 内耗电量的可行最小/最大值。"""
-    subs = [m for m in meters if m.role == "sub"]
-    total = next(m for m in meters if m.role == "total")
-    j_query = next(i for i, m in enumerate(subs) if m.meter_id == query_meter_id)
+@dataclass
+class LPModel:
+    """一组读数对应的线性规划（约束与变量界，不含目标）。"""
 
-    # 1) 时间轴：全部读数时刻 + 查询起止时刻
-    cuts = {q_start_ms, q_end_ms}
+    meters: list[MeterSeries]
+    subs: list[MeterSeries]
+    ts: list[int]
+    pos: dict[int, int]
+    dt_h: np.ndarray
+    n_intervals: int
+    n_subs: int
+    bounds: list[tuple[float, float]]
+    a_eq: np.ndarray
+    b_eq: np.ndarray
+
+
+def build_lp(
+    meters: list[MeterSeries], extra_cuts: set[int] | None = None
+) -> LPModel:
+    """根据整批读数构建约束矩阵；extra_cuts 为额外的时间轴切分点。"""
+    subs = [m for m in meters if m.role == "sub"]
+
+    # 1) 时间轴：全部读数时刻（+ 额外切分点，如查询起止时刻）
+    cuts = set(extra_cuts or ())
     for m in meters:
         cuts.update(m.times_ms)
     ts = sorted(cuts)
@@ -87,6 +98,8 @@ def solve_window(
     a_rows: list[np.ndarray] = []
     b_vals: list[float] = []
 
+    total = next(m for m in meters if m.role == "total")
+
     def add_reading_constraints(m: MeterSeries, coef) -> None:
         for k0, k1, delta_v in _reading_deltas(m, pos):
             row = np.zeros(n_vars)
@@ -101,24 +114,67 @@ def solve_window(
     for j0, m in enumerate(subs):  # 各分表自身读数
         add_reading_constraints(m, lambda j, j0=j0: 1.0 if j == j0 else 0.0)
 
-    a_eq = np.vstack(a_rows)
-    b_eq = np.asarray(b_vals)
+    return LPModel(
+        meters=meters,
+        subs=subs,
+        ts=ts,
+        pos=pos,
+        dt_h=dt_h,
+        n_intervals=n_intervals,
+        n_subs=n_subs,
+        bounds=bounds,
+        a_eq=np.vstack(a_rows),
+        b_eq=np.asarray(b_vals),
+    )
+
+
+def check_batch_feasible(meters: list[MeterSeries]) -> SolveResult:
+    """整批读数物理相容性检查：约束存在可行解即相容（发布前闸门）。"""
+    lp = build_lp(meters)
+    c = np.zeros(lp.n_subs * lp.n_intervals)
+    res = linprog(
+        c, A_eq=lp.a_eq, b_eq=lp.b_eq, bounds=lp.bounds, method="highs"
+    )
+    if res.status == 2:
+        return SolveResult(feasible=False, diagnostics=diagnose(meters))
+    if res.status != 0:
+        raise RuntimeError(f"线性规划求解失败（相容性检查）：{res.message}")
+    return SolveResult(feasible=True)
+
+
+def solve_window(
+    meters: list[MeterSeries],
+    query_meter_id: str,
+    q_start_ms: int,
+    q_end_ms: int,
+) -> SolveResult:
+    """求指定分表在 [q_start_ms, q_end_ms) 内耗电量的可行最小/最大值。"""
+    lp = build_lp(meters, extra_cuts={q_start_ms, q_end_ms})
+    j_query = next(
+        i for i, m in enumerate(lp.subs) if m.meter_id == query_meter_id
+    )
+    n_intervals = lp.n_intervals
 
     # 4) 目标：查询分表在查询窗口内的耗电量
-    c = np.zeros(n_vars)
+    c = np.zeros(lp.n_subs * n_intervals)
     c[
-        j_query * n_intervals + pos[q_start_ms] : j_query * n_intervals
-        + pos[q_end_ms]
+        j_query * n_intervals
+        + lp.pos[q_start_ms] : j_query * n_intervals
+        + lp.pos[q_end_ms]
     ] = 1.0
 
-    res_min = linprog(c, A_eq=a_eq, b_eq=b_eq, bounds=bounds, method="highs")
+    res_min = linprog(
+        c, A_eq=lp.a_eq, b_eq=lp.b_eq, bounds=lp.bounds, method="highs"
+    )
     if res_min.status == 2:
         # 不可行：读数不相容
         return SolveResult(feasible=False, diagnostics=diagnose(meters))
     if res_min.status != 0:
         raise RuntimeError(f"线性规划求解失败（求最小值）：{res_min.message}")
 
-    res_max = linprog(-c, A_eq=a_eq, b_eq=b_eq, bounds=bounds, method="highs")
+    res_max = linprog(
+        -c, A_eq=lp.a_eq, b_eq=lp.b_eq, bounds=lp.bounds, method="highs"
+    )
     if res_max.status != 0:
         raise RuntimeError(f"线性规划求解失败（求最大值）：{res_max.message}")
 

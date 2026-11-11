@@ -57,46 +57,68 @@ class Query(BaseModel):
     _normalize_end = field_validator("end")(_require_tz)
 
 
+def validate_meter_batch(meters: list[Meter]) -> None:
+    """跨表的整批结构校验（发布与即时推算共用）。"""
+    totals = [m for m in meters if m.role == "total"]
+    subs = [m for m in meters if m.role == "sub"]
+    if len(totals) != 1:
+        raise ValueError(f"必须且只能有 1 个总表，当前 {len(totals)} 个")
+    if not 2 <= len(subs) <= 6:
+        raise ValueError(f"分表数量须为 2~6 个，当前 {len(subs)} 个")
+    ids = [m.meter_id for m in meters]
+    if len(set(ids)) != len(ids):
+        raise ValueError("meter_id 存在重复")
+
+    # 观测期：所有表首读数时刻的最小值、末读数时刻的最大值；
+    # 每只表都必须恰好覆盖观测期首尾。
+    t0 = min(min(r.time for r in m.readings) for m in meters)
+    t1 = max(max(r.time for r in m.readings) for m in meters)
+    if not t0 < t1:
+        raise ValueError("观测期起点必须早于终点")
+    for m in meters:
+        first = min(r.time for r in m.readings)
+        last = max(r.time for r in m.readings)
+        if first != t0 or last != t1:
+            raise ValueError(
+                f"表 {m.meter_id} 缺少观测期首尾读数：观测期为 "
+                f"[{t0.isoformat()}, {t1.isoformat()}]，该表读数范围为 "
+                f"[{first.isoformat()}, {last.isoformat()}]"
+            )
+
+
+def validate_query_against_meters(meters: list[Meter], q: Query) -> None:
+    """查询窗口与整批读数的关系校验。"""
+    subs = {m.meter_id for m in meters if m.role == "sub"}
+    t0 = min(min(r.time for r in m.readings) for m in meters)
+    t1 = max(max(r.time for r in m.readings) for m in meters)
+    if q.meter_id not in subs:
+        raise ValueError(f"查询对象 {q.meter_id} 必须是某个分表")
+    if not (t0 <= q.start < q.end <= t1):
+        raise ValueError(
+            f"查询起止时刻须满足 观测期起点 <= start < end <= 观测期终点，"
+            f"观测期为 [{t0.isoformat()}, {t1.isoformat()}]"
+        )
+
+
+class MeterBatch(BaseModel):
+    """按结算期发布的整批电表读数（与 /infer 入参中的 meters 同构）。"""
+
+    meters: list[Meter] = Field(description="1 个总表 + 2~6 个分表的完整批次")
+
+    @model_validator(mode="after")
+    def _check_batch(self) -> "MeterBatch":
+        validate_meter_batch(self.meters)
+        return self
+
+
 class InferRequest(BaseModel):
     meters: list[Meter] = Field(description="1 个总表 + 2~6 个分表")
     query: Query
 
     @model_validator(mode="after")
     def _check_request(self) -> "InferRequest":
-        totals = [m for m in self.meters if m.role == "total"]
-        subs = [m for m in self.meters if m.role == "sub"]
-        if len(totals) != 1:
-            raise ValueError(f"必须且只能有 1 个总表，当前 {len(totals)} 个")
-        if not 2 <= len(subs) <= 6:
-            raise ValueError(f"分表数量须为 2~6 个，当前 {len(subs)} 个")
-        ids = [m.meter_id for m in self.meters]
-        if len(set(ids)) != len(ids):
-            raise ValueError("meter_id 存在重复")
-
-        # 观测期：所有表首读数时刻的最小值、末读数时刻的最大值；
-        # 每只表都必须恰好覆盖观测期首尾。
-        t0 = min(min(r.time for r in m.readings) for m in self.meters)
-        t1 = max(max(r.time for r in m.readings) for m in self.meters)
-        if not t0 < t1:
-            raise ValueError("观测期起点必须早于终点")
-        for m in self.meters:
-            first = min(r.time for r in m.readings)
-            last = max(r.time for r in m.readings)
-            if first != t0 or last != t1:
-                raise ValueError(
-                    f"表 {m.meter_id} 缺少观测期首尾读数：观测期为 "
-                    f"[{t0.isoformat()}, {t1.isoformat()}]，该表读数范围为 "
-                    f"[{first.isoformat()}, {last.isoformat()}]"
-                )
-
-        q = self.query
-        if q.meter_id not in {m.meter_id for m in subs}:
-            raise ValueError(f"查询对象 {q.meter_id} 必须是某个分表")
-        if not (t0 <= q.start < q.end <= t1):
-            raise ValueError(
-                f"查询起止时刻须满足 观测期起点 <= start < end <= 观测期终点，"
-                f"观测期为 [{t0.isoformat()}, {t1.isoformat()}]"
-            )
+        validate_meter_batch(self.meters)
+        validate_query_against_meters(self.meters, self.query)
         return self
 
 
@@ -116,3 +138,83 @@ class InferResponse(BaseModel):
     diagnostics: list[str] = Field(
         default_factory=list, description="读数不相容时的原因说明"
     )
+
+
+# ---------------------------------------------------------------------------
+# 按结算期发布
+# ---------------------------------------------------------------------------
+
+
+class PublishRequest(MeterBatch):
+    """按结算期发布整批读数的请求。"""
+
+    expected_version: int = Field(
+        ge=0,
+        description="预期当前正式版本号（首次发布该结算期时传 0）；"
+        "与服务端当前版本一致才允许提交",
+    )
+    request_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端请求键（幂等键）：同结算期同键同内容重传返回原结果；"
+        "同键异内容拒绝",
+    )
+
+
+class PublishResponse(BaseModel):
+    """发布成功的响应（也是同键重传时回放的原始发布结果）。"""
+
+    status: Literal["published", "replayed"] = Field(
+        description="published=本次原子发布成功；replayed=同键重传，回放原发布结果"
+    )
+    period: str = Field(description="结算期标识")
+    version: int = Field(description="发布后的正式版本号（从 1 开始递增）")
+    request_key: str
+    content_hash: str = Field(description="批次内容的规范化 SHA-256 摘要")
+    meters: list[Meter] = Field(description="已发布的整批读数")
+    published_at: datetime = Field(description="首次发布时间（UTC）")
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# 按结算期推算（使用已发布的正式版本）
+# ---------------------------------------------------------------------------
+
+
+class PeriodInferRequest(BaseModel):
+    """对已发布结算期的推算请求（query 结构与 /infer 一致）。"""
+
+    query: Query
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "PeriodInferRequest":
+        # 与已发布读数的关系校验在路由层完成（需要从存储读取该期数据）
+        return self
+
+
+class PeriodInferResponse(InferResponse):
+    """按结算期推算的响应：推算结果 + 整次推算所使用的同一版读数版本号。"""
+
+    period: str
+    version: int = Field(description="本次推算读取的正式读数版本号")
+
+
+class PeriodSummary(BaseModel):
+    """单个结算期的当前状态。"""
+
+    period: str
+    current_version: int = Field(description="当前正式版本号；0 表示尚无正式读数")
+    meter_count: int = Field(description="当前版本包含的表计数量（无版本时为 0）")
+    published_at: datetime | None = Field(
+        default=None, description="当前版本发布时间（UTC）"
+    )
+
+
+class VersionInfo(BaseModel):
+    """某结算期的一个历史版本。"""
+
+    version: int
+    content_hash: str
+    request_key: str
+    published_at: datetime
+    meter_count: int
